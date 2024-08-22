@@ -4,8 +4,8 @@ from collections import Counter
 from joblib import Parallel, delayed
 
 
-def initial_state(Y, data1, data2,data3,p, N3, ld_boundaries,var_pos, tau, alpha=1.0, a0k=.5, b0k=.5):
-    num_clusters = len(var_pos)
+def initial_state(Y, data1, data2,data3,p, N3, ld_boundaries,k, tau, alpha=1.0, a0k=.1, b0k=.1):
+    num_clusters = k
     n_snp = len(data3)
     n_idv = len(Y)
     state = {
@@ -22,7 +22,6 @@ def initial_state(Y, data1, data2,data3,p, N3, ld_boundaries,var_pos, tau, alpha
         'B3': [],
         'A3':[],
         'C':[],
-        'same_assig':[],
         'beta1': np.zeros(n_snp),
         'beta2': np.zeros(n_snp),
         'beta3': np.zeros(n_snp),
@@ -31,26 +30,29 @@ def initial_state(Y, data1, data2,data3,p, N3, ld_boundaries,var_pos, tau, alpha
             "a0k": a0k,"b0k": b0k,
             "a0": 0.1,"b0": 0.1,
         },
+        'suffstats': np.array([0]*(num_clusters)),
         'det_sigma_':0,
 	    'assignment': np.zeros(n_snp),
         'pi': np.array([alpha / num_clusters]*num_clusters),
         'p': np.array([p,1-p]),
-        'var': var_pos,# possible variance
+        'var': np.zeros(k),# possible variance
         'h2_1': 0,
         'h2_3': 0,
         'eta': 1,
 	    'tau':tau,
-        'alpha':0,
-        'W1':np.zeros(n_idv),
+        'V': np.zeros(num_clusters),
+        'alpha':1,
+        #'W1':np.zeros(n_idv),
         'residual':np.zeros(n_idv)
     }
 
     # define indexes
     state['a'] = 0.1/N3; state['c'] = 1
-    state['A'] = Y-state['alpha']*state['W1']*np.ones(len(Y))
+    state['A'] = Y#-state['alpha']*state['W1']*np.ones(len(Y))
     print('start assignment',sum(state['assignment']))
     
     return state   
+    
     
    
 def calc_b(j, state, ld_boundaries, ref_ld_mat3):
@@ -196,30 +198,105 @@ def sample_beta(j, state,  ld_boundaries,  ref_ld_mat3, rho, VS=True):
     state['beta3'][start_i:end_i] = beta3
 
 
-def gibbs_stick_break(state, rho, ld_boundaries, ref_ld_mat3,sample_assig, n_threads=4, VS=True):
-    #condition = (state['assignment']==state['sample_assig']) & (state['assignment']==1)
-    #print('assignment same:',sum(state['assignment']==state['sample_assig']), 'one',sum(state['assignment']==1),'true',sum(state['sample_assig']),'both',sum(condition))   
-    #print('variance of residual is ',np.var(state['residual']))
-    var1 = np.zeros(state['N3_'])
-    var3 = 0
-    #state['assignment'] = sample_assig
+def update_suffstats(state):
+    suff_stats = dict(Counter(state['assignment']))
+    suff_stats.update(dict.fromkeys(np.setdiff1d(range(state['num_clusters_']), list(suff_stats.keys())), 0))
+    suff_stats = {k:suff_stats[k] for k in sorted(suff_stats)}
+    state['suffstats'] = suff_stats
+    
+def sample_sigma2(state, rho, VS=True):
+    b = np.zeros(state['num_clusters_'])
+    a = np.array(list(state['suffstats'].values() ))*1.5 + state['hyperparameters_']['a0k']
+    table = [[] for i in range(state['num_clusters_'])]
+    assignment = state['assignment']
+    for i in range(len(assignment)):
+        table[int(assignment[i])].append(i)
+    rho_1,rho_2,rho_3 = rho
+    det_sigma = state['det_sigma_']
+    # shared with correlation
+    for i in range(state['num_clusters_']):
+        beta1 = state['beta1'][table[i]]
+        beta2 = state['beta2'][table[i]]
+        beta3 = state['beta3'][table[i]]
+        b[i] = np.sum( ((1 - rho_3**2)*beta1**2 + (1 - rho_2**2)*beta2 **2 + (1 - rho_1**2)*beta3**2 \
+         - 2*(rho_1 - rho_2*rho_3)*beta1*beta2  \
+         - 2*(rho_2 - rho_1*rho_3)*beta1*beta3 \
+         - 2*(rho_3 - rho_1*rho_2)*beta2*beta3 )/ 2*det_sigma ) + state['hyperparameters_']['b0k']
+        
+    out = np.array([0.0]*state['num_clusters_'])
+    if VS is True:
+        out[1:] = stats.invgamma(a=a[1:], scale=b[1:]).rvs()
+        out[0] = 0
+    else: 
+        out = dict(zip(range(0, state['num_clusters_']), stats.invgamma(a=a, scale=b).rvs()))
+    print('a',max(a),np.argmax(a),'b',max(b),'var',max(out),np.argmax(out))
+    state['var'] = out
+
+
+
+def sample_V(state):
+    suffstats = np.array(list(state['suffstats'].values()))
+    a = 1 + suffstats[:-1]
+    b = state['alpha'] + np.cumsum(suffstats[::-1])[:-1][::-1]
+    sample_val = stats.beta(a=a, b=b).rvs()
+    m = state['num_clusters_']
+    
+    if 1 in sample_val:
+        idx = np.argmax(sample_val == 1)
+        sample_val[idx+1:] = 0
+        sample_return = dict(zip(range(1,m), sample_val))
+        sample_return[m-1] = 0
+    else:
+        sample_return = dict(zip(range(1,m), sample_val))
+        sample_return[m-1] = 1
+    state['V'] = [0]+list(sample_return.values())
+    
+# Compute pi
+def update_pi(state):
+    #state['pi'][0] = state['pi_pop'][0]
+    V = state['V']
+    m = len(V)
+    a = np.cumprod(1-np.array(V)[0:(m-1)])*V[1:]
+    pi = dict()
+    pi[0] = V[0]
+    pi.update(dict(zip(range(1, m), a)))  
+    # last p may be less than 0 due to rounding error
+    if pi[m-1] < 0: 
+        pi[m-1] = 0
+    state['pi'] = list(pi.values())
+
+def parallel_task(j, ld_boundaries, state, ref_ld_mat3):
+    start_i = ld_boundaries[j][0]
+    end_i = ld_boundaries[j][1]
+
+    X1_i = state['X1_'][start_i:end_i]
+    X2_i = state['X2_'][start_i:end_i]
+
+    ref_ld3 = ref_ld_mat3[j]
+    var3_contrib = np.sum(state['beta3'][start_i:end_i] * np.dot(ref_ld3, state['beta3'][start_i:end_i]))
+    return var3_contrib
+    
+def gibbs_stick_break(state, rho, ld_boundaries, ref_ld_mat3,n_threads=4, VS=True):
+    sample_sigma2(state,rho) 
     for j in range(len(ld_boundaries)):
         calc_b(j, state, ld_boundaries, ref_ld_mat3)
         sample_assignment(j,ld_boundaries, ref_ld_mat3, state, rho=rho, VS=True)
         sample_beta(j, state, ld_boundaries,ref_ld_mat3 , rho=rho, VS=True)
-        state['residual'] = state['A']-np.dot(state['beta1'],state['X1_'])-np.dot(state['beta2'],state['X2_']) 
-        #print(j,'max(residual)',max(state['residual']),min(state['residual']), np.var(state['residual']))
-              
-    #state['assignment'] = np.concatenate(Parallel(n_jobs=n_threads, require='sharedmem')(delayed(sample_assignment)(j=j, ld_boundaries= ld_boundaries, ref_ld_mat3=ref_ld_mat3, state=state, rho=rho, VS=True) for j in range(len(ld_boundaries))))
-    for j in range(len(ld_boundaries)):    
-        start_i = ld_boundaries[j][0]
-        end_i = ld_boundaries[j][1]
-    
-        X1_i = state['X1_'][start_i:end_i]
-        X2_i = state['X2_'][start_i:end_i]
+        state['residual'] = state['A']-state['eta']*np.dot(state['beta1'],state['X1_'])-state['eta']*np.dot(state['beta2'],state['X2_']) 
         
-        ref_ld3 = ref_ld_mat3[j]
-        var3 = var3+np.sum(state['beta3'][start_i:end_i] * np.dot(ref_ld3, state['beta3'][start_i:end_i]))
-
+    update_suffstats(state)
+    sample_V(state) 
+    update_pi(state) 
+    '''
+    sample_eta(state, ld_boundaries)##note
+    state['assignment'] = np.concatenate(Parallel(n_jobs=n_threads, require='sharedmem')(delayed(sample_assignment)(j=j, ld_boundaries= ld_boundaries, ref_ld_mat3=ref_ld_mat3, state=state, rho=rho, VS=True) for j in range(len(ld_boundaries))))
+    for j in range(len(ld_boundaries)):
+        sample_beta(j, state, ld_boundaries,ref_ld_mat3 , rho=rho, VS=True)
+    state['residual'] = state['A']-state['eta']*np.dot(state['beta1'],state['X1_'])-state['eta']*np.dot(state['beta2'],state['X2_']) 
+    '''       
+    results = Parallel(n_jobs=-1)(
+        delayed(parallel_task)(j, ld_boundaries, state, ref_ld_mat3)
+        for j in range(len(ld_boundaries))
+    )
     state['h2_1'] = np.var(np.dot(state['beta1'],state['X1_'])+np.dot(state['beta2'],state['X2_']))/np.var(state['Y_'])
-    state['h2_3'] = var3
+    state['h2_3'] = sum(results)
